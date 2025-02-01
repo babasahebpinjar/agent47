@@ -1,0 +1,135 @@
+Field	Type	Description
+log_id	INT64 (Primary Key)	Unique identifier for each log entry (e.g., a sequence number or UUID converted to a long). Required by Milvus as the primary key.
+timestamp	INT64	Unix timestamp in milliseconds or seconds. Allows time-based filtering and sorting.
+service	VARCHAR (max_length=100)	Source service or system (e.g., "k8s", "backend", "postgres", "apache").
+log_level	VARCHAR (max_length=20)	Severity level (e.g., "INFO", "WARN", "ERROR", "DEBUG").
+host	VARCHAR (max_length=100)	Host machine or node name. (For Kubernetes, this could be the node name; for databases, the server hostname, etc.)
+namespace	VARCHAR (max_length=100)	(Optional) Kubernetes namespace or other logical grouping. Can be empty for services that don’t have namespaces.
+pod_name	VARCHAR (max_length=100)	(Optional) Pod name (for K8s). You can leave it blank for non-K8s services.
+trace_id	VARCHAR (max_length=100)	(Optional) Trace/correlation ID if your logs include distributed tracing.
+raw_log	VARCHAR (max_length=65535)	The complete raw log string. Useful for future re-parsing or direct display to users.
+embedding	FLOAT_VECTOR(dim)	Embedding vector of dimension dim (e.g., 384, 512, or 768). Used for semantic similarity searches.
+
+
+Why a Unified Schema?
+
+    Simplicity: You don’t need to manage separate collections or code paths for each service.
+    Cross-Service Search: A single collection lets you run queries across all logs (e.g., “Find logs similar to this error message regardless of which service they come from”).
+    Hackathon-Friendly: One set of ingestion and query logic keeps your demo and prototypes straightforward.
+
+Example Pseudocode for Creating the Collection
+
+from pymilvus import (
+    connections, FieldSchema, CollectionSchema, DataType, Collection
+)
+
+# 1. Connect to Milvus
+connections.connect("default", host="localhost", port="19530")
+
+# 2. Define the fields
+fields = [
+    FieldSchema(name="log_id", dtype=DataType.INT64, is_primary=True),
+    FieldSchema(name="timestamp", dtype=DataType.INT64),
+    FieldSchema(name="service", dtype=DataType.VARCHAR, max_length=100),
+    FieldSchema(name="log_level", dtype=DataType.VARCHAR, max_length=20),
+    FieldSchema(name="host", dtype=DataType.VARCHAR, max_length=100),
+    FieldSchema(name="namespace", dtype=DataType.VARCHAR, max_length=100),
+    FieldSchema(name="pod_name", dtype=DataType.VARCHAR, max_length=100),
+    FieldSchema(name="trace_id", dtype=DataType.VARCHAR, max_length=100),
+    FieldSchema(name="raw_log", dtype=DataType.VARCHAR, max_length=65535),
+    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=768),  # adjust dim as needed
+]
+
+# 3. Create the schema
+schema = CollectionSchema(fields, description="Unified logs from multiple services")
+
+# 4. Create the collection
+collection_name = "all_logs"
+all_logs_collection = Collection(name=collection_name, schema=schema)
+
+# 5. Create a vector index for the embedding field
+index_params = {
+    "index_type": "IVF_FLAT",  # or HNSW, IVF_SQ8, etc.
+    "metric_type": "L2",
+    "params": {"nlist": 1024}
+}
+
+all_logs_collection.create_index(field_name="embedding", index_params=index_params)
+print(f"Created collection {collection_name} with index on embedding.")
+
+Data Insertion Flow
+
+    Ingest Raw Logs
+        From each service (Kubernetes, backend, PostgreSQL, etc.), gather logs in a common format (e.g., via file watchers, log shipping, or direct API calls).
+
+    Assign or Generate a log_id
+        E.g., a sequential ID, or a UUID converted to a numeric format.
+
+    Extract Fields
+        For logs that have Kubernetes metadata, fill in namespace, pod_name.
+        For database logs, you might leave namespace and pod_name blank.
+        Always specify service (e.g., "k8s", "postgres").
+
+    Vectorize the Log Message
+        Use your chosen embedding model (e.g., Sentence-BERT, local LLM) on the raw_log string.
+        Output a floating-point vector of dimension dim.
+
+    Insert into Milvus
+
+    # Example single-row insert (batch inserts recommended for performance)
+    data = [
+        [log_id],
+        [timestamp],
+        [service],
+        [log_level],
+        [host],
+        [namespace],
+        [pod_name],
+        [trace_id],
+        [raw_log],
+        [embedding_vector]
+    ]
+
+    mr = all_logs_collection.insert(data)
+
+Query & Analysis Examples
+
+    Vector Similarity Search
+        Convert an error message snippet into an embedding, then perform a top-k similarity search in the all_logs collection:
+
+    query_embedding = embed("OutOfMemory error in container X")  
+    search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
+
+    results = all_logs_collection.search(
+      data=[query_embedding],
+      anns_field="embedding",
+      param=search_params,
+      limit=10,
+      expr=None  # or add filters, e.g. expr="service == 'k8s'"
+    )
+
+Hybrid Filter (Time + Service)
+
+    Only look at ERROR logs from k8s in the last 24 hours:
+
+        now = int(time.time() * 1000)
+        one_day_ago = now - 24*60*60*1000
+
+        filter_expr = f"service == 'k8s' && log_level == 'ERROR' && timestamp >= {one_day_ago}"
+        results = all_logs_collection.search(
+          data=[query_embedding],
+          anns_field="embedding",
+          param=search_params,
+          limit=10,
+          expr=filter_expr
+        )
+
+    Cross-Service Analysis
+        Without specifying a filter on service, your search automatically covers all logs from all services. This is powerful for diagnosing cross-service issues.
+
+Hackathon Tips
+
+    Keep the dim size manageable. High-dimensional embeddings can be large; 384 or 512 is often sufficient for log messages.
+    Batch Insert. For large logs, insert them in batches to improve performance.
+    Index Tuning. For quick demos, IVF_FLAT or HNSW are good starts. In a production setting, you’d experiment with various index types (e.g., IVF_SQ8, RHNSW_FLAT) for speed and memory trade-offs.
+    Optional Fields. Some fields might be empty for certain logs (e.g., pod_name is only for k8s). That’s fine—just fill them with "" or None.
